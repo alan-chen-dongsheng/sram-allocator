@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Strategy pattern tests — 3 built-in strategies across 4 scenarios."""
 
-import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src", "python"))
 
 from sram_allocator import (
     SRAMAllocator, DAGBuilder, print_report, visualize_allocation,

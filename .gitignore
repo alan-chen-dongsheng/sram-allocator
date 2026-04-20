@@ -21,3 +21,6 @@ __pycache__/
 # Test outputs
 *.json
 trace*.json
+
+# scikit-build-core build cache
+.skbuilddir/

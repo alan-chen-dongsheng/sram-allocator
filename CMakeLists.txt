@@ -6,28 +6,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-find_package(pybind11 REQUIRED CONFIG
-    PATHS /usr/local/lib/python3.12/dist-packages/pybind11/share/cmake/pybind11
-)
+# Let .so find libsram_alloc.so in the same directory at runtime
+set(CMAKE_BUILD_RPATH "\$ORIGIN")
+set(CMAKE_INSTALL_RPATH "\$ORIGIN")
+
+find_package(pybind11 CONFIG REQUIRED)
 
 # Core library
-add_library(sram_alloc SHARED
-    src/cpp/linear_scan.cpp
-)
+add_library(sram_alloc SHARED src/cpp/linear_scan.cpp)
+target_compile_options(sram_alloc PRIVATE -O3 -Wall)
 
-# pybind11 bindings
-pybind11_add_module(_core MODULE
-    src/cpp/bindings.cpp
-)
+# pybind11 Python extension
+pybind11_add_module(_core MODULE src/cpp/bindings.cpp)
+target_link_libraries(_core PRIVATE sram_alloc)
 
-target_link_libraries(_core PRIVATE sram_alloc ${Python3_LIBRARIES})
-
-# Copy to Python package
-set(PYTHON_PKG "${CMAKE_SOURCE_DIR}/src/python/sram_allocator")
-add_custom_command(TARGET sram_alloc POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:sram_alloc> ${PYTHON_PKG}/
-)
-add_custom_command(TARGET _core POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:_core> ${PYTHON_PKG}/
-)
+# Install targets — scikit-build-core packs them into the wheel
+install(TARGETS sram_alloc _core LIBRARY DESTINATION .)
