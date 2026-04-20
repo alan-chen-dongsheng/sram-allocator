@@ -1,0 +1,23 @@
+# Build
+build/
+*.so
+*.o
+
+# Python
+__pycache__/
+*.egg-info/
+*.egg-info
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Test outputs
+*.json
+trace*.json

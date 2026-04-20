@@ -1,0 +1,6 @@
+[project]
+name = "sram_allocator"
+version = "0.1.0"
+description = "Linear scan SRAM allocator for neural network DAGs"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
