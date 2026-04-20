@@ -177,7 +177,7 @@ std::vector<std::string> SRAMAllocator::topo_sort(const DAG& dag) {
 
     for (const auto& op : dag.ops) {
         all_ops.insert(op.name);
-        in_degree[op.name];  // ensure entry exists (default-initialized to 0)
+        in_degree[op.name];  // initialize to 0 before the dependency increment loop below
         for (const auto& dep : op.depends_on) {
             adj[dep].push_back(op.name);
             in_degree[op.name]++;
@@ -282,7 +282,7 @@ AllocationResult SRAMAllocator::allocate_from_tensors(
 }
 
 // ============================================================
-//  内部辅助函数（策略内部使用）
+//  辅助工具函数（策略内部使用）
 // ============================================================
 
 // 计算给定时间点的活跃内存和存活张量列表
