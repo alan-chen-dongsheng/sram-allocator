@@ -239,9 +239,6 @@ public:
 private:
     AllocConfig config_;
     std::shared_ptr<AllocationStrategy> strategy_;
-
-    // 内部工具
-    static int64_t align_up(int64_t size, int64_t alignment);
 };
 
 } // namespace sram
