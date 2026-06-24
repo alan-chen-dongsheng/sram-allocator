@@ -22,6 +22,10 @@ void PerfettoTracer::on_alloc(int time_step, const std::string& tensor,
 
 void PerfettoTracer::on_free(int time_step, const std::string& tensor,
                              int64_t offset, int64_t size) {
+    // Close the duration event started by on_alloc
+    events_.push_back({time_step * 1000, "E", "SRAM: " + tensor, "memory",
+                       1, 1, 0, 0, 0, 0, ""});
+    // Instant marker to make the free point visible
     events_.push_back({time_step * 1000, "i", "free: " + tensor, "memory",
                        1, 1, size, offset, 0, 0, "t"});
 }
@@ -97,6 +101,9 @@ std::string PerfettoTracer::to_json() const {
 
 void PerfettoTracer::save(const std::string& path) const {
     std::ofstream f(path);
+    if (!f.is_open()) {
+        throw std::runtime_error("PerfettoTracer::save: cannot open file: " + path);
+    }
     f << to_json();
     f.close();
 }
@@ -154,7 +161,11 @@ void SRAMAllocator::set_max_memory(int64_t max) { config_.max_memory = max; }
 void SRAMAllocator::set_verbose(bool v) { config_.verbose = v; }
 void SRAMAllocator::set_tracer(PerfettoTracer* t) { config_.tracer = t; }
 
-int64_t SRAMAllocator::align_up(int64_t size, int64_t alignment) {
+// ============================================================
+//  辅助工具函数（策略内部使用）
+// ============================================================
+
+static int64_t align_up(int64_t size, int64_t alignment) {
     return (size + alignment - 1) / alignment * alignment;
 }
 
@@ -166,7 +177,7 @@ std::vector<std::string> SRAMAllocator::topo_sort(const DAG& dag) {
 
     for (const auto& op : dag.ops) {
         all_ops.insert(op.name);
-        in_degree[op.name] = in_degree.count(op.name) ? in_degree[op.name] : 0;
+        in_degree[op.name];  // initialize to 0 before the dependency increment loop below
         for (const auto& dep : op.depends_on) {
             adj[dep].push_back(op.name);
             in_degree[op.name]++;
@@ -274,10 +285,6 @@ AllocationResult SRAMAllocator::allocate_from_tensors(
 //  辅助工具函数（策略内部使用）
 // ============================================================
 
-static int64_t align_up(int64_t size, int64_t alignment) {
-    return (size + alignment - 1) / alignment * alignment;
-}
-
 // 计算给定时间点的活跃内存和存活张量列表
 static void compute_active_at(
     int time_point,
@@ -298,6 +305,86 @@ static void compute_active_at(
     }
 }
 
+// 后处理：构建 timeline、检测溢出、组装 AllocationResult（三种策略共享）
+static AllocationResult finalize_alloc_result(
+    std::map<std::string, int64_t>&& offsets,
+    std::map<std::string, int64_t>&& sizes,
+    std::map<std::string, TensorLifetime>&& lifetimes,
+    int64_t total_without_reuse,
+    int num_reuses,
+    const std::vector<TensorLifetime>& sorted_tensors,
+    const AllocConfig& config) {
+
+    std::vector<TimelineSnapshot> timeline;
+    std::vector<OverflowEvent> violations;
+    int64_t global_peak = 0;
+
+    std::set<int> time_points;
+    for (const auto& t : sorted_tensors) {
+        time_points.insert(t.alive_from);
+        time_points.insert(t.alive_to);
+    }
+
+    for (int tp : time_points) {
+        int64_t active_mem = 0;
+        std::vector<std::string> live;
+        compute_active_at(tp, lifetimes, sizes, active_mem, live);
+
+        if (active_mem > global_peak) global_peak = active_mem;
+
+        TimelineSnapshot snap;
+        snap.time = tp;
+        snap.event = "SNAPSHOT";
+        snap.tensor_name = "";
+        snap.peak_memory = global_peak;
+        snap.active_memory = active_mem;
+        snap.live_tensors = live;
+        timeline.push_back(snap);
+
+        if (config.max_memory > 0 && active_mem > config.max_memory) {
+            OverflowEvent evt;
+            evt.time = tp;
+            evt.active_memory = active_mem;
+            evt.limit = config.max_memory;
+            evt.excess = active_mem - config.max_memory;
+            evt.live_tensors = live;
+            violations.push_back(evt);
+        }
+
+        if (config.tracer) {
+            config.tracer->on_peak(tp, global_peak, active_mem);
+            if (config.max_memory > 0 && active_mem > config.max_memory) {
+                config.tracer->on_overflow(tp, active_mem, config.max_memory);
+            }
+        }
+    }
+
+    bool overflow = !violations.empty();
+
+    AllocationResult result;
+    result.success = true;
+    result.tensor_offsets = std::move(offsets);
+    result.tensor_sizes = std::move(sizes);
+    result.tensor_lifetimes = std::move(lifetimes);
+    result.peak_memory = global_peak;
+    result.total_tensor_bytes = total_without_reuse;
+    result.reuse_ratio = total_without_reuse > 0
+        ? 1.0 - static_cast<double>(global_peak) / total_without_reuse
+        : 0.0;
+    result.num_reuses = num_reuses;
+    result.timeline = std::move(timeline);
+    result.overflow = overflow;
+
+    if (overflow) {
+        result.overflow_report.max_memory_limit = config.max_memory;
+        result.overflow_report.peak_memory = global_peak;
+        result.overflow_report.peak_excess = global_peak - config.max_memory;
+        result.overflow_report.violations = std::move(violations);
+    }
+
+    return result;
+}
+
 // ============================================================
 //  策略 1：Linear Scan (First-Fit)
 // ============================================================
@@ -310,7 +397,11 @@ AllocationResult LinearScanStrategy::allocate(
     const std::vector<TensorLifetime>& tensors,
     const AllocConfig& config) const {
 
-    if (tensors.empty()) return {};
+    if (tensors.empty()) {
+        AllocationResult r;
+        r.success = true;
+        return r;
+    }
 
     auto sorted = tensors;
     std::sort(sorted.begin(), sorted.end(), [](const TensorLifetime& a, const TensorLifetime& b) {
@@ -337,11 +428,11 @@ AllocationResult LinearScanStrategy::allocate(
         int64_t aligned_size = align_up(tensor.size, config.alignment);
         total_without_reuse += aligned_size;
 
-        // 释放过期张量
+        // 释放过期张量，使用张量自身的到期时刻作为 free 时间
         for (auto it = active.begin(); it != active.end(); ) {
             if (it->alive_to < tensor.alive_from) {
                 if (config.tracer) {
-                    config.tracer->on_free(tensor.alive_from, it->name, it->start, it->size);
+                    config.tracer->on_free(it->alive_to + 1, it->name, it->start, it->size);
                 }
                 it = active.erase(it);
             } else {
@@ -368,8 +459,13 @@ AllocationResult LinearScanStrategy::allocate(
         }
 
         if (offset == -1) {
-            offset = total_allocated;
-            total_allocated = offset + aligned_size;
+            // 没有内部间隙：尝试使用尾部空闲空间，否则扩展高水位
+            offset = cursor;
+            if (cursor + aligned_size <= total_allocated) {
+                num_reuses++;  // 复用了已释放的尾部空间
+            } else {
+                total_allocated = cursor + aligned_size;
+            }
         } else {
             num_reuses++;
         }
@@ -379,7 +475,6 @@ AllocationResult LinearScanStrategy::allocate(
         sizes[tensor.name] = aligned_size;
         lifetimes[tensor.name] = tensor;
 
-        // tracer alloc 回调
         if (config.tracer) {
             config.tracer->on_alloc(tensor.alive_from, tensor.name, offset, aligned_size);
         }
@@ -391,76 +486,9 @@ AllocationResult LinearScanStrategy::allocate(
         }
     }
 
-    // 构建 timeline + 溢出检测（后处理，三个策略共享）
-    std::vector<TimelineSnapshot> timeline;
-    std::vector<OverflowEvent> violations;
-    int64_t global_peak = 0;
-
-    std::set<int> time_points;
-    for (const auto& t : sorted) {
-        time_points.insert(t.alive_from);
-        time_points.insert(t.alive_to);
-    }
-
-    for (int tp : time_points) {
-        int64_t active_mem = 0;
-        std::vector<std::string> live;
-        compute_active_at(tp, lifetimes, sizes, active_mem, live);
-
-        if (active_mem > global_peak) global_peak = active_mem;
-
-        TimelineSnapshot snap;
-        snap.time = tp;
-        snap.event = "SNAPSHOT";
-        snap.tensor_name = "";
-        snap.peak_memory = global_peak;
-        snap.active_memory = active_mem;
-        snap.live_tensors = live;
-        timeline.push_back(snap);
-
-        // 溢出检测
-        if (config.max_memory > 0 && active_mem > config.max_memory) {
-            OverflowEvent evt;
-            evt.time = tp;
-            evt.active_memory = active_mem;
-            evt.limit = config.max_memory;
-            evt.excess = active_mem - config.max_memory;
-            evt.live_tensors = live;
-            violations.push_back(evt);
-        }
-
-        // tracer peak 回调
-        if (config.tracer) {
-            config.tracer->on_peak(tp, global_peak, active_mem);
-            if (config.max_memory > 0 && active_mem > config.max_memory) {
-                config.tracer->on_overflow(tp, active_mem, config.max_memory);
-            }
-        }
-    }
-
-    bool overflow = !violations.empty();
-
-    AllocationResult result;
-    result.success = true;
-    result.tensor_offsets = offsets;
-    result.tensor_sizes = sizes;
-    result.tensor_lifetimes = lifetimes;
-    result.peak_memory = global_peak;
-    result.total_tensor_bytes = total_without_reuse;
-    result.reuse_ratio = total_without_reuse > 0 ?
-        1.0 - (double)global_peak / total_without_reuse : 0;
-    result.num_reuses = num_reuses;
-    result.timeline = timeline;
-    result.overflow = overflow;
-
-    if (overflow) {
-        result.overflow_report.max_memory_limit = config.max_memory;
-        result.overflow_report.peak_memory = global_peak;
-        result.overflow_report.peak_excess = global_peak - config.max_memory;
-        result.overflow_report.violations = std::move(violations);
-    }
-
-    return result;
+    return finalize_alloc_result(
+        std::move(offsets), std::move(sizes), std::move(lifetimes),
+        total_without_reuse, num_reuses, sorted, config);
 }
 
 // ============================================================
@@ -475,7 +503,11 @@ AllocationResult BestFitStrategy::allocate(
     const std::vector<TensorLifetime>& tensors,
     const AllocConfig& config) const {
 
-    if (tensors.empty()) return {};
+    if (tensors.empty()) {
+        AllocationResult r;
+        r.success = true;
+        return r;
+    }
 
     auto sorted = tensors;
     std::sort(sorted.begin(), sorted.end(), [](const TensorLifetime& a, const TensorLifetime& b) {
@@ -502,10 +534,11 @@ AllocationResult BestFitStrategy::allocate(
         int64_t aligned_size = align_up(tensor.size, config.alignment);
         total_without_reuse += aligned_size;
 
+        // 释放过期张量，使用张量自身的到期时刻作为 free 时间
         for (auto it = active.begin(); it != active.end(); ) {
             if (it->alive_to < tensor.alive_from) {
                 if (config.tracer) {
-                    config.tracer->on_free(tensor.alive_from, it->name, it->start, it->size);
+                    config.tracer->on_free(it->alive_to + 1, it->name, it->start, it->size);
                 }
                 it = active.erase(it);
             } else {
@@ -513,7 +546,7 @@ AllocationResult BestFitStrategy::allocate(
             }
         }
 
-        // Best-Fit：找最小的能容纳的空闲区间
+        // Best-Fit：在所有空闲区间（含尾部剩余空间）中找剩余量最小的
         int64_t best_offset = -1;
         int64_t best_remaining = -1;
 
@@ -538,17 +571,21 @@ AllocationResult BestFitStrategy::allocate(
             cursor = std::max(cursor, at.start + at.size);
         }
 
-        if (best_offset == -1 || (total_allocated - cursor) >= aligned_size) {
-            if (best_offset == -1 ||
-                (best_remaining == -1 || (total_allocated - cursor) < best_remaining)) {
-                if (best_offset == -1 || (total_allocated - cursor) >= aligned_size) {
-                    best_offset = total_allocated;
-                    total_allocated = best_offset + aligned_size;
-                }
+        // 将尾部空闲空间也作为候选（正确比较剩余量而非空间总量）
+        int64_t trailing_space = total_allocated - cursor;
+        if (trailing_space >= aligned_size) {
+            int64_t trailing_remaining = trailing_space - aligned_size;
+            if (best_remaining == -1 || trailing_remaining < best_remaining) {
+                best_offset = cursor;
+                best_remaining = trailing_remaining;
             }
         }
 
-        if (best_offset < total_allocated - aligned_size) {
+        if (best_offset == -1) {
+            // 没有任何合适的空闲区间，必须扩展高水位
+            best_offset = cursor;
+            total_allocated = cursor + aligned_size;
+        } else {
             num_reuses++;
         }
 
@@ -568,76 +605,9 @@ AllocationResult BestFitStrategy::allocate(
         }
     }
 
-    // 构建 timeline + 溢出检测
-    std::vector<TimelineSnapshot> timeline;
-    std::vector<OverflowEvent> violations;
-    int64_t global_peak = 0;
-
-    std::set<int> time_points;
-    for (const auto& t : sorted) {
-        time_points.insert(t.alive_from);
-        time_points.insert(t.alive_to);
-    }
-
-    for (int tp : time_points) {
-        int64_t active_mem = 0;
-        std::vector<std::string> live;
-        compute_active_at(tp, lifetimes, sizes, active_mem, live);
-
-        if (active_mem > global_peak) global_peak = active_mem;
-
-        TimelineSnapshot snap;
-        snap.time = tp;
-        snap.event = "SNAPSHOT";
-        snap.tensor_name = "";
-        snap.peak_memory = global_peak;
-        snap.active_memory = active_mem;
-        snap.live_tensors = live;
-        timeline.push_back(snap);
-
-        // 溢出检测
-        if (config.max_memory > 0 && active_mem > config.max_memory) {
-            OverflowEvent evt;
-            evt.time = tp;
-            evt.active_memory = active_mem;
-            evt.limit = config.max_memory;
-            evt.excess = active_mem - config.max_memory;
-            evt.live_tensors = live;
-            violations.push_back(evt);
-        }
-
-        // tracer 回调
-        if (config.tracer) {
-            config.tracer->on_peak(tp, global_peak, active_mem);
-            if (config.max_memory > 0 && active_mem > config.max_memory) {
-                config.tracer->on_overflow(tp, active_mem, config.max_memory);
-            }
-        }
-    }
-
-    bool overflow = !violations.empty();
-
-    AllocationResult result;
-    result.success = true;
-    result.tensor_offsets = offsets;
-    result.tensor_sizes = sizes;
-    result.tensor_lifetimes = lifetimes;
-    result.peak_memory = global_peak;
-    result.total_tensor_bytes = total_without_reuse;
-    result.reuse_ratio = total_without_reuse > 0 ?
-        1.0 - (double)global_peak / total_without_reuse : 0;
-    result.num_reuses = num_reuses;
-    result.timeline = timeline;
-    result.overflow = overflow;
-
-    if (overflow) {
-        result.overflow_report.max_memory_limit = config.max_memory;
-        result.overflow_report.peak_memory = global_peak;
-        result.overflow_report.peak_excess = global_peak - config.max_memory;
-        result.overflow_report.violations = std::move(violations);
-    }
-
-    return result;
+    return finalize_alloc_result(
+        std::move(offsets), std::move(sizes), std::move(lifetimes),
+        total_without_reuse, num_reuses, sorted, config);
 }
 
 // ============================================================
@@ -652,7 +622,11 @@ AllocationResult LargestFirstStrategy::allocate(
     const std::vector<TensorLifetime>& tensors,
     const AllocConfig& config) const {
 
-    if (tensors.empty()) return {};
+    if (tensors.empty()) {
+        AllocationResult r;
+        r.success = true;
+        return r;
+    }
 
     auto sorted = tensors;
     std::sort(sorted.begin(), sorted.end(), [](const TensorLifetime& a, const TensorLifetime& b) {
@@ -678,10 +652,11 @@ AllocationResult LargestFirstStrategy::allocate(
         int64_t aligned_size = align_up(tensor.size, config.alignment);
         total_without_reuse += aligned_size;
 
+        // 释放过期张量，使用张量自身的到期时刻作为 free 时间
         for (auto it = active.begin(); it != active.end(); ) {
             if (it->alive_to < tensor.alive_from) {
                 if (config.tracer) {
-                    config.tracer->on_free(tensor.alive_from, it->name, it->start, it->size);
+                    config.tracer->on_free(it->alive_to + 1, it->name, it->start, it->size);
                 }
                 it = active.erase(it);
             } else {
@@ -689,6 +664,7 @@ AllocationResult LargestFirstStrategy::allocate(
             }
         }
 
+        // First-Fit：找第一个能容纳的空闲区间
         int64_t offset = -1;
         auto active_sorted = active;
         std::sort(active_sorted.begin(), active_sorted.end(),
@@ -706,8 +682,13 @@ AllocationResult LargestFirstStrategy::allocate(
         }
 
         if (offset == -1) {
-            offset = total_allocated;
-            total_allocated = offset + aligned_size;
+            // 没有内部间隙：尝试使用尾部空闲空间，否则扩展高水位
+            offset = cursor;
+            if (cursor + aligned_size <= total_allocated) {
+                num_reuses++;  // 复用了已释放的尾部空间
+            } else {
+                total_allocated = cursor + aligned_size;
+            }
         } else {
             num_reuses++;
         }
@@ -723,80 +704,14 @@ AllocationResult LargestFirstStrategy::allocate(
 
         if (config.verbose) {
             std::cout << "  ALLOC " << tensor.name << " (size=" << aligned_size
-                      << ", offset=" << offset << ")\n";
+                      << ", offset=" << offset << ", alive=["
+                      << tensor.alive_from << "," << tensor.alive_to << "])\n";
         }
     }
 
-    // 构建 timeline + 溢出检测
-    std::vector<TimelineSnapshot> timeline;
-    std::vector<OverflowEvent> violations;
-    int64_t global_peak = 0;
-
-    std::set<int> time_points;
-    for (const auto& t : sorted) {
-        time_points.insert(t.alive_from);
-        time_points.insert(t.alive_to);
-    }
-
-    for (int tp : time_points) {
-        int64_t active_mem = 0;
-        std::vector<std::string> live;
-        compute_active_at(tp, lifetimes, sizes, active_mem, live);
-
-        if (active_mem > global_peak) global_peak = active_mem;
-
-        TimelineSnapshot snap;
-        snap.time = tp;
-        snap.event = "SNAPSHOT";
-        snap.tensor_name = "";
-        snap.peak_memory = global_peak;
-        snap.active_memory = active_mem;
-        snap.live_tensors = live;
-        timeline.push_back(snap);
-
-        // 溢出检测
-        if (config.max_memory > 0 && active_mem > config.max_memory) {
-            OverflowEvent evt;
-            evt.time = tp;
-            evt.active_memory = active_mem;
-            evt.limit = config.max_memory;
-            evt.excess = active_mem - config.max_memory;
-            evt.live_tensors = live;
-            violations.push_back(evt);
-        }
-
-        // tracer 回调
-        if (config.tracer) {
-            config.tracer->on_peak(tp, global_peak, active_mem);
-            if (config.max_memory > 0 && active_mem > config.max_memory) {
-                config.tracer->on_overflow(tp, active_mem, config.max_memory);
-            }
-        }
-    }
-
-    bool overflow = !violations.empty();
-
-    AllocationResult result;
-    result.success = true;
-    result.tensor_offsets = offsets;
-    result.tensor_sizes = sizes;
-    result.tensor_lifetimes = lifetimes;
-    result.peak_memory = global_peak;
-    result.total_tensor_bytes = total_without_reuse;
-    result.reuse_ratio = total_without_reuse > 0 ?
-        1.0 - (double)global_peak / total_without_reuse : 0;
-    result.num_reuses = num_reuses;
-    result.timeline = timeline;
-    result.overflow = overflow;
-
-    if (overflow) {
-        result.overflow_report.max_memory_limit = config.max_memory;
-        result.overflow_report.peak_memory = global_peak;
-        result.overflow_report.peak_excess = global_peak - config.max_memory;
-        result.overflow_report.violations = std::move(violations);
-    }
-
-    return result;
+    return finalize_alloc_result(
+        std::move(offsets), std::move(sizes), std::move(lifetimes),
+        total_without_reuse, num_reuses, sorted, config);
 }
 
 } // namespace sram

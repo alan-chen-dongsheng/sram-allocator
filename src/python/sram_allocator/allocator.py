@@ -44,7 +44,7 @@ class AllocationResult:
     timeline: list = field(default_factory=list)
     overflow: bool = False
     violations: List[OverflowViolation] = field(default_factory=list)
-    _cpp_result = None
+    _cpp_result: object = field(default=None, repr=False)
 
     def summary(self) -> str:
         if not self.success:
@@ -159,7 +159,7 @@ class SRAMAllocator:
     def _wrap_result(self, cpp_result) -> AllocationResult:
         # Parse violations
         violations = []
-        if cpp_result.overflow and hasattr(cpp_result, 'overflow_report'):
+        if cpp_result.overflow:
             report = cpp_result.overflow_report
             for v in report.violations:
                 violations.append(OverflowViolation(
@@ -179,8 +179,8 @@ class SRAMAllocator:
             num_reuses=cpp_result.num_reuses,
             tensor_offsets=dict(cpp_result.tensor_offsets),
             tensor_sizes=dict(cpp_result.tensor_sizes),
-            timeline=list(cpp_result.timeline) if hasattr(cpp_result, 'timeline') else [],
-            overflow=cpp_result.overflow if hasattr(cpp_result, 'overflow') else False,
+            timeline=list(cpp_result.timeline),
+            overflow=cpp_result.overflow,
             violations=violations,
         )
         result._cpp_result = cpp_result

@@ -137,7 +137,8 @@ PYBIND11_MODULE(_core, m) {
         .def("set_verbose", &sram::SRAMAllocator::set_verbose,
              py::arg("v"))
         .def("set_tracer", &sram::SRAMAllocator::set_tracer,
-             py::arg("tracer"))
+             py::arg("tracer"),
+             py::keep_alive<1, 2>())  // tracer must outlive the allocator
         .def("allocate", &sram::SRAMAllocator::allocate,
              py::arg("dag"))
         .def("allocate_from_tensors",
