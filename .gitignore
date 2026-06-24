@@ -24,3 +24,4 @@ trace*.json
 
 # scikit-build-core build cache
 .skbuilddir/
+.cache
