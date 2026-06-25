@@ -171,7 +171,7 @@ class PerfettoTracer {
 public:
     // 记录事件（分配策略内部调用）
     void on_alloc(int time_step, const std::string& tensor,
-                  int64_t offset, int64_t size);
+                  int64_t offset, int64_t size, int duration_steps);
     void on_free(int time_step, const std::string& tensor,
                  int64_t offset, int64_t size);
     void on_peak(int time_step, int64_t peak_bytes, int64_t active_bytes);
@@ -195,6 +195,7 @@ private:
         int64_t bytes = 0;
         int64_t limit = 0;
         std::string s; // scope for instant
+        int64_t dur = 0; // 持续时长（complete 事件 X，= duration_steps * 1000）
     };
     std::vector<TraceEvent> events_;
 };

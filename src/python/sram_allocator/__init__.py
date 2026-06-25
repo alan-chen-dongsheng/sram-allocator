@@ -10,6 +10,7 @@ from .allocator import (
     register_strategy,
     create_strategy,
 )
+from ._core import DAG, OpNode, TensorLifetime
 from .builder import DAGBuilder
 from .visualizer import visualize_allocation, print_report
 
@@ -19,5 +20,6 @@ __all__ = [
     "LinearScanStrategy", "BestFitStrategy", "LargestFirstStrategy",
     "PerfettoTracer",
     "register_strategy", "create_strategy",
+    "DAG", "OpNode", "TensorLifetime",
     "DAGBuilder", "visualize_allocation", "print_report",
 ]
