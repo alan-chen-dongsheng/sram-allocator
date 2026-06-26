@@ -5,6 +5,64 @@
 
 namespace py = pybind11;
 
+// Trampoline class to allow Python subclasses of AllocationStrategy
+class PyAllocationStrategy : public sram::AllocationStrategy {
+public:
+    using sram::AllocationStrategy::AllocationStrategy;
+
+    std::string name() const override {
+        PYBIND11_OVERRIDE_PURE(
+            std::string,
+            sram::AllocationStrategy,
+            name
+        );
+    }
+
+    sram::AllocationResult allocate(
+        const std::vector<sram::TensorLifetime>& tensors,
+        const sram::AllocConfig& config) const override {
+        // Acquire GIL for calling back into Python
+        py::gil_scoped_acquire gil;
+        py::function py_allocate = py::get_override(this, "allocate");
+        if (!py_allocate) {
+            throw std::runtime_error(
+                "Python AllocationStrategy subclass must override allocate()");
+        }
+        py::object py_result = py_allocate(tensors, config);
+
+        // If it's already a C++ AllocationResult, return it directly
+        if (py::isinstance<py::class_<sram::AllocationResult>::type>(py_result)) {
+            try {
+                return py_result.cast<sram::AllocationResult>();
+            } catch (...) {
+                // Fall through to dataclass extraction
+            }
+        }
+
+        // Otherwise, extract fields from a Python object (dataclass or duck-typed)
+        sram::AllocationResult result;
+        result.success = py_result.attr("success").cast<bool>();
+        result.error_msg = py_result.attr("error_msg").cast<std::string>();
+        result.peak_memory = py_result.attr("peak_memory").cast<int64_t>();
+        result.reuse_ratio = py_result.attr("reuse_ratio").cast<double>();
+        result.num_reuses = py_result.attr("num_reuses").cast<int>();
+        result.tensor_offsets = py_result.attr("tensor_offsets")
+            .cast<std::map<std::string, int64_t>>();
+        result.tensor_sizes = py_result.attr("tensor_sizes")
+            .cast<std::map<std::string, int64_t>>();
+        // total_tensor_bytes maps from Python's total_without_reuse
+        if (py::hasattr(py_result, "total_without_reuse")) {
+            result.total_tensor_bytes =
+                py_result.attr("total_without_reuse").cast<int64_t>();
+        }
+        // Optional fields
+        if (py::hasattr(py_result, "overflow")) {
+            result.overflow = py_result.attr("overflow").cast<bool>();
+        }
+        return result;
+    }
+};
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Linear Scan SRAM Allocator — Strategy Pattern Edition";
     m.attr("__version__") = "0.3.0";
@@ -56,6 +114,14 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("active_memory", &sram::TimelineSnapshot::active_memory)
         .def_readwrite("live_tensors", &sram::TimelineSnapshot::live_tensors);
 
+    // ===== AllocConfig (needed for Python-defined strategies) =====
+    py::class_<sram::AllocConfig>(m, "AllocConfig")
+        .def(py::init<>())
+        .def_readwrite("alignment", &sram::AllocConfig::alignment)
+        .def_readwrite("sram_size", &sram::AllocConfig::sram_size)
+        .def_readwrite("max_memory", &sram::AllocConfig::max_memory)
+        .def_readwrite("verbose", &sram::AllocConfig::verbose);
+
     // ===== Overflow types =====
     py::class_<sram::OverflowEvent>(m, "OverflowEvent")
         .def(py::init<>())
@@ -97,24 +163,33 @@ PYBIND11_MODULE(_core, m) {
         });
 
     // ===== Strategy Classes =====
-    py::class_<sram::AllocationStrategy, std::shared_ptr<sram::AllocationStrategy>>(
+    py::class_<sram::AllocationStrategy, PyAllocationStrategy, std::shared_ptr<sram::AllocationStrategy>>(
         m, "AllocationStrategy")
-        .def("name", &sram::AllocationStrategy::name);
+        .def(py::init<>())
+        .def("name", &sram::AllocationStrategy::name)
+        .def("allocate", &sram::AllocationStrategy::allocate,
+             py::arg("tensors"), py::arg("config"));
 
     py::class_<sram::LinearScanStrategy, sram::AllocationStrategy,
                std::shared_ptr<sram::LinearScanStrategy>>(m, "LinearScanStrategy")
         .def(py::init<>())
-        .def("name", &sram::LinearScanStrategy::name);
+        .def("name", &sram::LinearScanStrategy::name)
+        .def("allocate", &sram::LinearScanStrategy::allocate,
+             py::arg("tensors"), py::arg("config"));
 
     py::class_<sram::BestFitStrategy, sram::AllocationStrategy,
                std::shared_ptr<sram::BestFitStrategy>>(m, "BestFitStrategy")
         .def(py::init<>())
-        .def("name", &sram::BestFitStrategy::name);
+        .def("name", &sram::BestFitStrategy::name)
+        .def("allocate", &sram::BestFitStrategy::allocate,
+             py::arg("tensors"), py::arg("config"));
 
     py::class_<sram::LargestFirstStrategy, sram::AllocationStrategy,
                std::shared_ptr<sram::LargestFirstStrategy>>(m, "LargestFirstStrategy")
         .def(py::init<>())
-        .def("name", &sram::LargestFirstStrategy::name);
+        .def("name", &sram::LargestFirstStrategy::name)
+        .def("allocate", &sram::LargestFirstStrategy::allocate,
+             py::arg("tensors"), py::arg("config"));
 
     // ===== PerfettoTracer =====
     py::class_<sram::PerfettoTracer>(m, "PerfettoTracer")

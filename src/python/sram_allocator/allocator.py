@@ -8,12 +8,17 @@ from ._core import (
     DAG, OpNode, TensorLifetime,
     LinearScanStrategy, BestFitStrategy, LargestFirstStrategy,
     AllocationStrategy, PerfettoTracer,
-    register_strategy, create_strategy,
+    register_strategy as _core_register_strategy,
+    create_strategy as _core_create_strategy,
 )
+
+# Python-level registry for custom strategies to avoid pybind11 factory conversion issues
+_python_strategies: Dict[str, AllocationStrategy] = {}
 
 # Export strategies
 __all__ = [
     "SRAMAllocator", "AllocationResult",
+    "AllocationStrategy",
     "LinearScanStrategy", "BestFitStrategy", "LargestFirstStrategy",
     "PerfettoTracer",
     "register_strategy", "create_strategy",
@@ -122,11 +127,20 @@ class SRAMAllocator:
             - 'linear_scan'   (default, First-Fit)
             - 'best_fit'      (Best-Fit)
             - 'largest_first' (Sort by size descending)
+        Custom names registered via `register_strategy()` are also accepted.
         """
-        strategy = create_strategy(name)
+        # Check Python registry first (for Python-defined strategies)
+        if name in _python_strategies:
+            self._cpp.set_strategy(_python_strategies[name])
+            return
+        # Fall back to C++ registry (built-in strategies)
+        strategy = _core_create_strategy(name)
         if strategy is None:
+            available = list(_python_strategies.keys()) + [
+                'linear_scan', 'best_fit', 'largest_first'
+            ]
             raise ValueError(f"Unknown strategy: '{name}'. "
-                             f"Available: linear_scan, best_fit, largest_first")
+                             f"Available: {', '.join(available)}")
         self._cpp.set_strategy(strategy)
 
     def get_strategy_name(self) -> str:
@@ -185,3 +199,31 @@ class SRAMAllocator:
         )
         result._cpp_result = cpp_result
         return result
+
+
+def register_strategy(name: str, factory):
+    """Register a custom allocation strategy.
+
+    Args:
+        name: Strategy name for use with `set_strategy_by_name()`.
+        factory: A callable (typically a lambda) that returns an `AllocationStrategy` instance.
+                 The instance is created once and cached.
+
+    Example:
+        register_strategy('my_strategy', lambda: MyCustomStrategy())
+        alloc.set_strategy_by_name('my_strategy')
+    """
+    instance = factory()
+    if not isinstance(instance, AllocationStrategy):
+        raise TypeError(
+            f"Factory must return an AllocationStrategy instance, "
+            f"got {type(instance).__name__}"
+        )
+    _python_strategies[name] = instance
+
+
+def create_strategy(name: str) -> Optional[AllocationStrategy]:
+    """Look up a strategy by name. Checks the Python registry first, then the C++ registry."""
+    if name in _python_strategies:
+        return _python_strategies[name]
+    return _core_create_strategy(name)

@@ -29,8 +29,14 @@ cp build/*.so src/python/sram_allocator/
 ### Run tests
 
 ```bash
+# All tests in a file
 python3 test.py              # 5 basic functional scenarios
 python3 test_strategies.py   # Strategy comparison + isolation tests
+
+# A single test function (scripts are pytest-compatible)
+python3 -m pytest test.py::test_linear_chain -v
+# Or without pytest:
+python3 -c "from test import test_linear_chain; test_linear_chain()"
 ```
 
 Tests are standalone scripts with `test_*` functions. Each builds a DAG with `DAGBuilder`, allocates via `SRAMAllocator`, and asserts on `result.success` / `result.reuse_ratio`.
@@ -45,18 +51,26 @@ Tests are standalone scripts with `test_*` functions. Each builds a DAG with `DA
 - `bindings.cpp` — pybind11 bindings exposing C++ to Python
 
 **Python layer** (`src/python/sram_allocator/`):
-- `allocator.py` — High-level `SRAMAllocator` API wrapping C++ core
+- `allocator.py` — High-level `SRAMAllocator` API wrapping C++ core, plus `AllocationResult` / `OverflowViolation` dataclasses
 - `builder.py` — `DAGBuilder` for constructing computation graphs
-- `visualizer.py` — Reporting and visualization utilities
+- `visualizer.py` — `print_report()` and `visualize_allocation()` ASCII reporting
 
 ### Strategy pattern
 
 Three allocation strategies implement `AllocationStrategy::allocate()`:
-- **LinearScan** — First-fit allocation
-- **BestFit** — Minimizes fragmentation
-- **LargestFirst** — Allocates largest tensors first
+
+| Strategy | Class | Registered name | Behavior |
+|---|---|---|---|
+| Linear Scan | `LinearScanStrategy` | `linear_scan` | First-fit allocation (default) |
+| Best Fit | `BestFitStrategy` | `best_fit` | Minimizes fragmentation |
+| Largest First | `LargestFirstStrategy` | `largest_first` | Allocates largest tensors first |
 
 Strategies self-register via static `AutoRegister*` structs, making them accessible through `set_strategy_by_name()`.
+
+### Two allocation entry points
+
+- `alloc.allocate(dag)` — takes a `DAG`, internally runs topological sort + lifetime computation, then allocates.
+- `alloc.allocate_from_tensors(tensors)` — takes a pre-built `list[TensorLifetime]`, bypasses DAG construction. Used when lifetimes are known externally.
 
 ### Adding a new strategy
 
@@ -82,23 +96,75 @@ struct AutoRegisterMy { AutoRegisterMy() {
 static AutoRegisterMy auto_reg_my;
 ```
 
+4. Rebuild (`pip install -e .`) and use via `alloc.set_strategy_by_name("my_strategy")` or from Python with `register_strategy("my_strategy", lambda: MyCustomStrategy())`.
+
 ### Key data structures
 
-- `TensorLifetime` — Tensor lifecycle: name, size, alive_from, alive_to
-- `OpNode` — Operator node: name, op_type, inputs, output, depends_on
-- `DAG` — Computation graph: list of ops
-- `AllocationResult` — Allocation output: offsets, sizes, peak_memory, timeline, overflow_report
-- `OverflowReport` — Violations list with time, active memory, limit, excess, live_tensors
+- `TensorLifetime` — Tensor lifecycle: name, size, producer, consumers, alive_from, alive_to
+- `OpNode` — Operator node: name, op_type, inputs, output, output_size, depends_on
+- `DAG` — Computation graph: name + list of ops
+- `AllocationResult` — Allocation output (Python dataclass): `tensor_offsets`, `tensor_sizes`, `peak_memory`, `total_without_reuse`, `reuse_ratio`, `num_reuses`, `timeline`, `overflow`, `violations`
+- `OverflowViolation` — Single overflow point: `time`, `active_memory`, `limit`, `excess`, `live_tensors`
+- `TimelineSnapshot` — Per-event memory snapshot: `time`, `event` (string: "alloc"/"free"/"peak"), `tensor_name`, `peak_memory`, `active_memory`, `live_tensors`
+
+C++-only types (not exposed to Python): `AllocConfig`, `MemoryBlock`, `OverflowReport`/`OverflowEvent` (mapped to `OverflowViolation` in Python).
+
+### Key Python API
+
+```python
+from sram_allocator import (
+    SRAMAllocator, DAGBuilder, PerfettoTracer,
+    AllocationStrategy, AllocationResult,
+    LinearScanStrategy, BestFitStrategy, LargestFirstStrategy,
+    register_strategy, create_strategy,
+    visualize_allocation, print_report,
+)
+
+# Constructor options
+alloc = SRAMAllocator(
+    strategy=BestFitStrategy(),   # optional, defaults to LinearScan
+    alignment=64,                 # byte alignment; rounds each tensor's SIZE up to this multiple, inflating memory usage
+    max_memory=200 * 1024,        # peak limit; violations recorded, alloc continues
+    verbose=True,
+    tracer=PerfettoTracer(),      # optional; enables Chrome Trace output
+)
+
+# DAG builder presets
+DAGBuilder.build_simple_cnn(name)
+DAGBuilder.build_resnet_block(name, in_ch, out_ch, h, w)
+DAGBuilder.build_linear_chain(name, num_ops, tensor_size)
+DAGBuilder.build_fork_join(name, branch_size)
+
+# DAG builder primitives
+builder = DAGBuilder("net")
+builder.add_op(name, op_type, inputs, output_size, depends_on)
+builder.add_conv / add_matmul / add_add / add_relu / add_pool / add_reshape / add_concat
+
+# Custom Python strategy
+class MyStrategy(AllocationStrategy):
+    def name(self): return "my_strategy"
+    def allocate(self, tensors, config):
+        result = AllocationResult(success=True, error_msg="", ...)
+        # populate tensor_offsets, tensor_sizes, peak_memory, etc.
+        return result
+
+register_strategy("my_strategy", lambda: MyStrategy())
+alloc.set_strategy_by_name("my_strategy")
+
+# Perfetto trace: open https://ui.perfetto.dev/ and drag in the JSON
+alloc.save_perfetto_trace("trace.json")
+```
 
 ## Coding Conventions
 
-**C++**: C++17, compiled with `-O3 -Wall`, no GNU extensions. Core types in `sram` namespace. `PascalCase` for classes/structs, `snake_case` for fields/methods. `CMAKE_EXPORT_COMPILE_COMMANDS` is on for clangd/LSP.
+**C++**: C++17, compiled with `-O3 -Wall`, no GNU extensions. Core types in `sram` namespace. `PascalCase` for classes/structs, `snake_case` for fields/methods. `CMAKE_EXPORT_COMPILE_COMMANDS` is on — `compile_commands.json` is generated for clangd/LSP; re-run cmake after CMakeLists.txt changes to keep it in sync.
 
-**Python**: 3.10+, type hints, `@dataclass` for result/struct types, `snake_case` naming.
+**Python**: 3.10+, 4-space indent, type hints, `@dataclass` for result/struct types, `snake_case` naming.
 
-## Key features
+## Troubleshooting
 
-- **Memory reuse** — Minimizes peak SRAM by reusing memory blocks
-- **Overflow detection** — Set `max_memory` limit; violations reported but allocation continues
-- **Perfetto tracing** — Optional Chrome Trace JSON output for visualization in perfetto UI
-- **Zero-overhead optional** — `tracer=nullptr` means no tracing overhead; `max_memory=-1` disables overflow detection
+- **`ModuleNotFoundError: No module named 'sram_allocator._core'`** — the C++ extension hasn't been built. Run `pip install -e .` or the manual build steps above and ensure `*.so` files exist under `src/python/sram_allocator/` or in the installed package.
+- **Stale `compile_commands.json`** — re-run `cmake ..` in `build/` after editing `CMakeLists.txt` or adding source files.
+- **Strategy name not found** — built-in names are `linear_scan`, `best_fit`, `largest_first`. Custom strategies must be registered before `set_strategy_by_name()` is called.
+- **Overflow not reported** — `max_memory` defaults to `-1` (disabled). Pass a positive value to enable; violations are recorded but allocation still completes.
+- **Trace file empty** — a `PerfettoTracer` must be passed to the `SRAMAllocator` constructor *before* `allocate()` is called; events are not backfilled.

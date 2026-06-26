@@ -3,6 +3,7 @@
 from .allocator import (
     SRAMAllocator,
     AllocationResult,
+    AllocationStrategy,
     LinearScanStrategy,
     BestFitStrategy,
     LargestFirstStrategy,
@@ -16,7 +17,7 @@ from .visualizer import visualize_allocation, print_report
 
 __version__ = "0.3.0"
 __all__ = [
-    "SRAMAllocator", "AllocationResult",
+    "SRAMAllocator", "AllocationResult", "AllocationStrategy",
     "LinearScanStrategy", "BestFitStrategy", "LargestFirstStrategy",
     "PerfettoTracer",
     "register_strategy", "create_strategy",
